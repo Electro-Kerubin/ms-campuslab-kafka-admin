@@ -1,0 +1,81 @@
+# Microservicio administrador de Kafka
+spring:
+  application:
+    name: ms-campuslab-kafka-admin
+
+  # --- Seguridad: validación del JWT emitido por Azure AD ---
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Se configura por variable de entorno (TENANT_ID de Azure AD)
+          issuer-uri: https://login.microsoftonline.com/${TENANT_ID:changeme}/v2.0
+
+campuslab:
+  # --- Conexión al clúster Kafka ---
+  kafka:
+    # Lista de brokers separados por coma. Con el clúster de campuslab-infra/kafka/compose.yml:
+    #   localhost:9092,localhost:9093,localhost:9094   (desde el host)
+    #   kafka1:29092,kafka2:29092,kafka3:29092         (dentro de la red docker)
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    # Tiempo máximo de cada operación contra el clúster; si se supera se responde 503
+    request-timeout-ms: ${KAFKA_REQUEST_TIMEOUT_MS:8000}
+    # Propiedades extra del cliente (seguridad en la nube: security.protocol, sasl.*, ssl.*). Vacío en local.
+    properties: {}
+
+  # --- Topología que este servicio sabe aprovisionar (POST /api/kafka/topics/provision) ---
+  # Es la tabla de CONTEXT.md §9. Aprovisionar es idempotente: crea lo que falta y alinea las configuraciones del resto.
+  # Los tópicos DLT reciben los mensajes que los consumidores no pudieron procesar tras agotar los reintentos.
+  kafka-admin:
+    # true: si el clúster tiene menos brokers que el factor de replicación pedido (p. ej. el Kafka de desarrollo
+    # con 1 broker), el tópico se crea con tantas réplicas como brokers haya y la respuesta lo avisa.
+    adapt-replication-to-cluster: ${KAFKA_ADAPT_REPLICATION:true}
+    topics:
+      - name: bookings.events
+        partitions: 3
+        replication-factor: 3
+        configs:
+          cleanup.policy: delete
+          retention.ms: "604800000"        # 7 días: fuente de verdad que alimenta reportería y auditoría
+          min.insync.replicas: "2"
+      - name: audit.timeline
+        partitions: 3
+        replication-factor: 3
+        configs:
+          cleanup.policy: compact,delete   # conserva el último estado de cada reserva (clave = bookingId)
+          retention.ms: "2592000000"       # 30 días
+          min.insync.replicas: "2"
+          min.cleanable.dirty.ratio: "0.1"
+          segment.ms: "86400000"           # segmentos de 1 día: la compactación solo actúa sobre segmentos cerrados
+          delete.retention.ms: "86400000"
+      - name: bookings.events.DLT
+        partitions: 3
+        replication-factor: 3
+        configs:
+          cleanup.policy: delete
+          retention.ms: "1209600000"       # 14 días para analizar y reprocesar
+          min.insync.replicas: "2"
+      - name: audit.timeline.DLT
+        partitions: 3
+        replication-factor: 3
+        configs:
+          cleanup.policy: delete
+          retention.ms: "1209600000"
+          min.insync.replicas: "2"
+
+# Documentación de la API: http://localhost:8087/swagger-ui.html
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+# Puerto del servicio (BFF 8080, bookings 8081, catalog 8082, report 8083, notify 8084, mq-admin 8085, audit 8086)
+server:
+  port: ${SERVER_PORT:8087}
+
+logging:
+  level:
+    org.campuslab.kafkaadmin: INFO
+    org.apache.kafka: WARN

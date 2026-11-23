@@ -1,0 +1,179 @@
+package org.campuslab.kafkaadmin.exception;
+
+import jakarta.servlet.ServletException;
+import java.time.LocalDateTime;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.validation.BindException;
+import org.springframework.validation.method.ParameterErrors;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
+
+/**
+ * Convierte las excepciones en respuestas JSON con el mismo formato que el resto de los
+ * microservicios: {"timestamp", "status", "message"} y, en validaciones, "errors" por campo.
+ *
+ * <pre>
+ *  ResourceNotFoundException        404  el tópico o el grupo no existe
+ *  ResourceConflictException        409  ya existe, o el grupo está activo y no admite la operación
+ *  InvalidConfigurationException    400  clave de configuración desconocida o valor fuera de rango
+ *  UnprocessableOperationException  422  petición válida que el clúster no puede cumplir (más réplicas que brokers...)
+ *  BrokerUnavailableException       503  no hay respuesta del clúster
+ *  BrokerOperationException         502  el clúster rechazó la operación por una razón no prevista
+ * </pre>
+ */
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    // ---------- Validación de la entrada -> 400 ----------
+
+    // Cuerpo JSON (@RequestBody @Valid) o parámetros de la URL (@Valid sobre un record)
+    @ExceptionHandler(BindException.class)
+    public ResponseEntity<Map<String, Object>> handleBind(BindException ex) {
+        Map<String, String> errors = new LinkedHashMap<>();
+        ex.getBindingResult().getFieldErrors()
+                .forEach(e -> errors.merge(e.getField(), String.valueOf(e.getDefaultMessage()), GlobalExceptionHandler::join));
+        ex.getBindingResult().getGlobalErrors()
+                .forEach(e -> errors.merge(e.getObjectName(), String.valueOf(e.getDefaultMessage()), GlobalExceptionHandler::join));
+        return validationError(errors);
+    }
+
+    // Variables de ruta con restricciones (@PathVariable @Pattern ...)
+    @ExceptionHandler(HandlerMethodValidationException.class)
+    public ResponseEntity<Map<String, Object>> handleMethodValidation(HandlerMethodValidationException ex) {
+        Map<String, String> errors = new LinkedHashMap<>();
+        ex.getAllValidationResults().forEach(result -> {
+            // Un cuerpo @Valid trae los errores por campo (name, partitions...): se informan con el nombre del campo
+            if (result instanceof ParameterErrors bodyErrors) {
+                bodyErrors.getFieldErrors().forEach(e ->
+                        errors.merge(e.getField(), String.valueOf(e.getDefaultMessage()), GlobalExceptionHandler::join));
+                bodyErrors.getGlobalErrors().forEach(e ->
+                        errors.merge(e.getObjectName(), String.valueOf(e.getDefaultMessage()), GlobalExceptionHandler::join));
+                return;
+            }
+            String parameter = result.getMethodParameter().getParameterName();
+            result.getResolvableErrors().forEach(error ->
+                    errors.merge(parameter == null ? "request" : parameter,
+                            String.valueOf(error.getDefaultMessage()), GlobalExceptionHandler::join));
+        });
+        return validationError(errors);
+    }
+
+    // JSON mal formado, o valor fuera de un enum (type: "XYZ")
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<Map<String, Object>> handleUnreadable(HttpMessageNotReadableException ex) {
+        return build(HttpStatus.BAD_REQUEST,
+                "El cuerpo de la petición no es un JSON válido o tiene un valor no permitido (por ejemplo un tipo desconocido)");
+    }
+
+    // Errores de la capa web que Spring ya clasifica con su propio código: verbo no permitido (405), tipo de contenido que no
+    // es JSON (415), ruta inexistente (404), parámetro obligatorio ausente (400)... Son errores del cliente, no del servidor:
+    // sin este handler caían en el 500 genérico de abajo.
+    @ExceptionHandler(ServletException.class)
+    public ResponseEntity<Map<String, Object>> handleWebError(ServletException ex) {
+        HttpStatusCode status = ex instanceof org.springframework.web.ErrorResponse web
+                ? web.getStatusCode() : HttpStatus.INTERNAL_SERVER_ERROR;
+        String message = switch (status.value()) {
+            case 404 -> "Ruta no encontrada";
+            case 405 -> "Método HTTP no permitido para esta ruta";
+            case 415 -> "Tipo de contenido no soportado: la API recibe application/json";
+            default -> "La petición no es válida";
+        };
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("timestamp", LocalDateTime.now());
+        body.put("status", status.value());
+        body.put("message", message);
+        return ResponseEntity.status(status).body(body);
+    }
+
+    // Parámetro fuera de rango detectado dentro de un servicio (p. ej. limit al leer mensajes)
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, Object>> handleIllegalArgument(IllegalArgumentException ex) {
+        return build(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    // ---------- Reglas del recurso ----------
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(ResourceNotFoundException ex) {
+        return build(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    @ExceptionHandler(ResourceConflictException.class)
+    public ResponseEntity<Map<String, Object>> handleConflict(ResourceConflictException ex) {
+        return build(HttpStatus.CONFLICT, ex.getMessage());
+    }
+
+    @ExceptionHandler(InvalidConfigurationException.class)
+    public ResponseEntity<Map<String, Object>> handleInvalidConfiguration(InvalidConfigurationException ex) {
+        return build(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    @ExceptionHandler(UnprocessableOperationException.class)
+    public ResponseEntity<Map<String, Object>> handleUnprocessable(UnprocessableOperationException ex) {
+        return build(HttpStatus.UNPROCESSABLE_ENTITY, ex.getMessage());
+    }
+
+    // ---------- Clúster ----------
+
+    @ExceptionHandler(BrokerUnavailableException.class)
+    public ResponseEntity<Map<String, Object>> handleUnavailable(BrokerUnavailableException ex) {
+        log.error("Kafka no disponible", ex);
+        return build(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage());
+    }
+
+    @ExceptionHandler(BrokerOperationException.class)
+    public ResponseEntity<Map<String, Object>> handleBrokerOperation(BrokerOperationException ex) {
+        log.error("Kafka rechazó la operación", ex);
+        return build(HttpStatus.BAD_GATEWAY, ex.getMessage());
+    }
+
+    // ---------- Seguridad ----------
+
+    // @PreAuthorize rechazó el rol -> 403 (sin este handler caería en el 500 genérico)
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<Map<String, Object>> handleAccessDenied(AccessDeniedException ex) {
+        return build(HttpStatus.FORBIDDEN, "No tienes permisos para administrar Kafka");
+    }
+
+    // ---------- Cualquier otro error ----------
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, Object>> handleGeneric(Exception ex) {
+        log.error("Error inesperado", ex);
+        return build(HttpStatus.INTERNAL_SERVER_ERROR, "Error interno del servidor");
+    }
+
+    private ResponseEntity<Map<String, Object>> validationError(Map<String, String> errors) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("timestamp", LocalDateTime.now());
+        body.put("status", HttpStatus.BAD_REQUEST.value());
+        body.put("message", "La petición tiene datos inválidos");
+        body.put("errors", errors);
+        return ResponseEntity.badRequest().body(body);
+    }
+
+    private ResponseEntity<Map<String, Object>> build(HttpStatus status, String message) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("timestamp", LocalDateTime.now());
+        body.put("status", status.value());
+        body.put("message", message);
+        return ResponseEntity.status(status).body(body);
+    }
+
+    // Un campo con varias reglas rotas (p. ej. vacío y con formato inválido) muestra todos los mensajes
+    private static String join(String first, String second) {
+        return first.equals(second) ? first : first + "; " + second;
+    }
+}
